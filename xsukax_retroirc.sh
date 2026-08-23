@@ -32,7 +32,7 @@ apt-get update
 apt-get install -y --no-install-recommends python3 python3-aiohttp ca-certificates
 
 install -d -m 0755 "$APP_DIR"
-cat > "$APP_FILE" <<'PYAPP_XSUKAX_EOF_V213_RESPONSIVE'
+cat > "$APP_FILE" <<'PYAPP_XSUKAX_EOF_V214_STABILITY'
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -52,11 +52,14 @@ from urllib.parse import urlsplit
 from aiohttp import WSMsgType, web
 
 APP_NAME = "xsukax RetroIRC Client"
-VERSION = "2.1.3"
+VERSION = "2.1.4"
 BIND = os.getenv("XSUKAX_BIND", "127.0.0.1")
 PORT = int(os.getenv("XSUKAX_PORT", "8785"))
 ALLOW_PRIVATE_IRC = os.getenv("ALLOW_PRIVATE_IRC", "0") == "1"
 ALLOW_CROSS_ORIGIN = os.getenv("ALLOW_CROSS_ORIGIN", "0") == "1"
+IRC_CONNECT_TIMEOUT = max(10.0, float(os.getenv("XSUKAX_IRC_CONNECT_TIMEOUT", "35")))
+WS_SETUP_TIMEOUT = max(30.0, float(os.getenv("XSUKAX_WS_SETUP_TIMEOUT", "120")))
+WS_HEARTBEAT = max(20.0, float(os.getenv("XSUKAX_WS_HEARTBEAT", "60")))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("xsukax-retroirc")
@@ -952,7 +955,7 @@ legend{font-weight:bold;padding:0 5px}
       <p><b>Role colors:</b> hammer colors are fixed by IRC membership mode, never by that network's rank count: <b>+q yellow (owner/founder)</b>, <b>+a brown (admin/protected)</b>, <b>+o red (operator)</b>, <b>+h blue (half-op)</b>, <b>+v green (voice)</b>, and <b>gray for ordinary users</b>. A mode is treated as a membership privilege only when the server advertises it in <code>005 PREFIX=(modes)prefixes</code>. ChanServ and other service bots receive the color of their actual advertised channel status.</p>
       <p><b>Mobile layout:</b> on phones, the left navigation is hidden because the closable tab strip already provides room/query switching. The People button opens the user list as an overlay drawer and × hides it again, leaving the full chat width available while typing.</p>
       <p><b>Python service:</b> the browser uses one bidirectional WebSocket to the local xsukax Python service, which owns the IRC TCP/TLS connection. This avoids the long-running PHP worker and command-queue limitations.</p>
-      <p><b>Reconnect:</b> Python keeps the IRC socket and browser WebSocket in one asynchronous session. Automatic reconnect and room rejoin can be enabled on the connection page.</p>
+      <p><b>Reconnect:</b> Python keeps the IRC socket and browser WebSocket in one asynchronous session. Automatic reconnect and room rejoin can be enabled on the connection page. Reconnect attempts use generation guards and backoff so an older socket cannot start a second overlapping reconnect cycle.</p>
       <p><b>Security note:</b> private/reserved Custom Server targets are blocked by default. Set <code>ALLOW_PRIVATE_IRC=1</code> on the Python service only if LAN access is intentional.</p>
       <p class="muted">MSN-era visual styling is an interface homage only; xsukax RetroIRC Client is not affiliated with Microsoft, mIRC, or any IRC network.</p>
     </div>
@@ -974,6 +977,7 @@ const app = {
   lastConfig: null,
   reconnectTimer: null,
   reconnectAttempt: 0,
+  connectionGeneration: 0,
   pendingRejoin: [],
   nick: '',
   host: '',
@@ -1995,10 +1999,13 @@ async function sendRaw(command) {
 async function disconnect(reason='Leaving xsukax RetroIRC Client') {
   app.manualDisconnect = true;
   if (app.reconnectTimer) { clearTimeout(app.reconnectTimer); app.reconnectTimer = null; }
+  app.pendingRejoin = [];
 
+  // Invalidate callbacks from every previous socket before closing the current one.
+  // This prevents a delayed close event from an old reconnect attempt from starting
+  // another reconnect cycle after the user has already disconnected.
+  app.connectionGeneration += 1;
   const ws = app.ws;
-  // Detach immediately so a late WebSocket callback cannot restore the old client UI
-  // after the user has returned to the Connection Center.
   app.ws = null;
   if (ws) {
     if (ws.readyState === WebSocket.OPEN) {
@@ -2051,22 +2058,36 @@ async function disconnectAndReturn(reason='Leaving xsukax RetroIRC Client') {
 }
 
 async function reconnectNow() {
-  if (!app.lastConfig || app.connecting) return;
+  if (!app.lastConfig || app.connecting || app.manualDisconnect) return;
   const rejoin = app.lastConfig.autoRejoin ? currentOpenChannels() : [];
   app.pendingRejoin = rejoin;
-  app.manualDisconnect = false;
-  if (app.ws) { try { app.ws.close(); } catch {} }
+
+  // Invalidate and detach the previous socket first. Its eventual onclose callback
+  // is intentionally ignored by the generation checks in connectWithConfig().
+  app.connectionGeneration += 1;
+  const old = app.ws;
+  app.ws = null;
+  if (old) {
+    try { old.close(1000, 'reconnect replaced'); } catch {}
+  }
   await connectWithConfig({...app.lastConfig}, true);
 }
 
 function scheduleReconnect() {
-  if (app.manualDisconnect || !app.lastConfig?.autoReconnect || app.reconnectTimer || app.connecting) return;
+  if (app.manualDisconnect || !app.lastConfig?.autoReconnect || app.reconnectTimer || app.connecting || app.connected) return;
   app.reconnectAttempt += 1;
-  const delay = Math.min(30000, 2000 * Math.pow(1.6, Math.min(app.reconnectAttempt - 1, 6)));
+
+  // A calmer backoff prevents reconnect storms while still recovering quickly from
+  // a short network interruption. Add a little jitter so many clients do not all
+  // reconnect to an IRC network at exactly the same instant.
+  const base = Math.min(90000, 4000 * Math.pow(1.8, Math.min(app.reconnectAttempt - 1, 6)));
+  const delay = Math.round(base * (0.90 + Math.random() * 0.20));
+  const generationWhenScheduled = app.connectionGeneration;
   $('connectionStatus').textContent = `Disconnected — reconnecting in ${Math.ceil(delay/1000)}s…`;
   addMsg('Status', `*** Connection lost. Automatic reconnect attempt ${app.reconnectAttempt} is scheduled.`, 'error');
   app.reconnectTimer = setTimeout(() => {
     app.reconnectTimer = null;
+    if (app.manualDisconnect || app.connected || app.connecting || app.connectionGeneration !== generationWhenScheduled) return;
     reconnectNow();
   }, delay);
 }
@@ -2472,21 +2493,31 @@ async function connectWithConfig(config, reconnecting=false) {
   const url = `${scheme}//${location.host}/ws`;
   let clientStarted = reconnecting || $('client').style.display === 'block';
 
+  // Every connection attempt gets a monotonically increasing generation. Handlers
+  // from any older WebSocket immediately become inert, eliminating overlapping
+  // reconnect attempts and the false "Connection setup timed out" cycle they caused.
+  const generation = ++app.connectionGeneration;
+  const isCurrent = ws => app.connectionGeneration === generation && app.ws === ws && !app.manualDisconnect;
+
   try {
     const ws = new WebSocket(url);
     app.ws = ws;
 
     ws.onopen = () => {
-      // Ignore stale sockets from a connection the user already cancelled/disconnected.
-      if (app.ws !== ws || app.manualDisconnect) {
+      if (!isCurrent(ws)) {
         try { ws.close(1000, 'stale connection'); } catch {}
         return;
       }
-      ws.send(JSON.stringify({type:'connect', config}));
+      try {
+        ws.send(JSON.stringify({type:'connect', config}));
+      } catch (e) {
+        addMsg('Status', `*** Unable to send connection setup: ${e.message}`, 'error');
+        try { ws.close(); } catch {}
+      }
     };
 
     ws.onmessage = ev => {
-      if (app.ws !== ws || app.manualDisconnect) return;
+      if (!isCurrent(ws)) return;
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === 'irc') {
@@ -2533,6 +2564,7 @@ async function connectWithConfig(config, reconnecting=false) {
     };
 
     ws.onerror = () => {
+      if (!isCurrent(ws)) return;
       if (!clientStarted) {
         err.textContent = 'Unable to reach the xsukax Python WebSocket service.';
         err.style.display = 'block';
@@ -2540,22 +2572,28 @@ async function connectWithConfig(config, reconnecting=false) {
     };
 
     ws.onclose = () => {
+      // The most important reconnect guard: an older socket is not allowed to alter
+      // current state, clear app.connecting, or schedule another retry.
+      if (app.connectionGeneration !== generation || app.ws !== ws) return;
+
       const wasManual = app.manualDisconnect;
       app.connected = false;
       app.connecting = false;
-      if (app.ws === ws) app.ws = null;
+      app.ws = null;
       $('connectBtn').disabled = false;
       $('connectBtn').textContent = 'Connect to IRC';
       updateConnectionButtons();
       if (clientStarted && !wasManual) scheduleReconnect();
     };
   } catch (e) {
-    app.connecting = false;
-    err.textContent = e.message;
-    err.style.display = 'block';
-    updateConnectionButtons();
+    if (app.connectionGeneration === generation) {
+      app.connecting = false;
+      err.textContent = e.message;
+      err.style.display = 'block';
+      updateConnectionButtons();
+    }
   } finally {
-    if (!app.connecting) {
+    if (app.connectionGeneration === generation && !app.connecting) {
       $('connectBtn').disabled = false;
       $('connectBtn').textContent = 'Connect to IRC';
     }
@@ -2950,24 +2988,68 @@ class IRCSession:
         addresses = await resolve_public_addresses(host, port)
         tls = self.config["tls"]
         ssl_context = ssl.create_default_context() if tls else None
-        last_error: Exception | None = None
 
-        for address in addresses:
-            try:
-                kwargs: dict[str, Any] = {}
-                if tls:
-                    kwargs["ssl"] = ssl_context
-                    kwargs["server_hostname"] = host
-                self.reader, self.writer = await asyncio.wait_for(
-                    asyncio.open_connection(address, port, **kwargs), timeout=15
-                )
-                return
-            except Exception as exc:  # try another validated address
-                last_error = exc
+        async def attempt(address: str, delay: float) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+            # Stagger validated addresses slightly (happy-eyeballs style). This avoids
+            # waiting tens of seconds on an unusable IPv6 route before trying IPv4.
+            if delay:
+                await asyncio.sleep(delay)
+            kwargs: dict[str, Any] = {}
+            if tls:
+                kwargs["ssl"] = ssl_context
+                kwargs["server_hostname"] = host
+            return await asyncio.wait_for(
+                asyncio.open_connection(address, port, **kwargs),
+                timeout=IRC_CONNECT_TIMEOUT,
+            )
 
-        if last_error:
-            raise ConnectionError(str(last_error)) from last_error
-        raise ConnectionError("Unable to open the IRC connection.")
+        tasks = [
+            asyncio.create_task(attempt(address, min(i * 0.25, 1.5)), name=f"irc-connect-{i}")
+            for i, address in enumerate(addresses)
+        ]
+        errors: list[str] = []
+        try:
+            while tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    tasks.remove(task)
+                    try:
+                        reader, writer = task.result()
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception as exc:
+                        errors.append(str(exc))
+                        continue
+
+                    self.reader, self.writer = reader, writer
+                    for other in pending:
+                        other.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+                    # TCP keepalive lets the kernel discover silently broken routes while
+                    # IRC's normal PING/PONG continues to handle application liveness.
+                    sock = writer.get_extra_info("socket")
+                    if sock is not None:
+                        try:
+                            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            if hasattr(socket, "TCP_KEEPIDLE"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 90)
+                            if hasattr(socket, "TCP_KEEPINTVL"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 30)
+                            if hasattr(socket, "TCP_KEEPCNT"):
+                                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+                        except OSError:
+                            log.debug("Unable to tune TCP keepalive for IRC socket", exc_info=True)
+                    return
+
+            detail = errors[-1] if errors else "all validated addresses failed"
+            raise ConnectionError(detail)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def begin_registration(self) -> None:
         self.nick = self.config["nick"]
@@ -3184,21 +3266,21 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "app": APP_NAME, "version": VERSION})
+    return web.json_response({"ok": True, "app": APP_NAME, "version": VERSION, "irc_connect_timeout": IRC_CONNECT_TIMEOUT, "ws_setup_timeout": WS_SETUP_TIMEOUT, "ws_heartbeat": WS_HEARTBEAT})
 
 
 async def websocket_handler(request: web.Request) -> web.StreamResponse:
     if not origin_allowed(request):
         raise web.HTTPForbidden(text="Cross-origin WebSocket requests are not allowed.")
 
-    ws = web.WebSocketResponse(heartbeat=25, receive_timeout=None, max_msg_size=65536, autoping=True)
+    ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT, receive_timeout=None, max_msg_size=65536, autoping=True)
     await ws.prepare(request)
     session: IRCSession | None = None
     try:
         try:
-            first = await asyncio.wait_for(ws.receive(), timeout=30)
+            first = await asyncio.wait_for(ws.receive(), timeout=WS_SETUP_TIMEOUT)
         except asyncio.TimeoutError:
-            await ws.send_json({"type": "error", "message": "Connection setup timed out."})
+            await ws.send_json({"type": "error", "message": "Browser connection setup timed out before an IRC configuration was received."})
             return ws
         if first.type != WSMsgType.TEXT:
             await ws.send_json({"type": "error", "message": "A connection configuration was expected."})
@@ -3242,7 +3324,8 @@ def create_app() -> web.Application:
 if __name__ == "__main__":
     log.info("Starting %s %s on %s:%s", APP_NAME, VERSION, BIND, PORT)
     web.run_app(create_app(), host=BIND, port=PORT, access_log=None, print=None)
-PYAPP_XSUKAX_EOF_V213_RESPONSIVE
+
+PYAPP_XSUKAX_EOF_V214_STABILITY
 chmod 0755 "$APP_FILE"
 python3 -m py_compile "$APP_FILE"
 
@@ -3254,10 +3337,14 @@ XSUKAX_PORT=8785
 ALLOW_PRIVATE_IRC=0
 ALLOW_CROSS_ORIGIN=0
 LOG_LEVEL=INFO
+# Connection-stability tuning. Defaults are intentionally tolerant of slow/mobile links.
+XSUKAX_IRC_CONNECT_TIMEOUT=35
+XSUKAX_WS_SETUP_TIMEOUT=120
+XSUKAX_WS_HEARTBEAT=60
 EOF_CONFIG
 fi
 
-# Version 2.1.3 fixes membership colors by IRC mode (q/a/o/h/v), adds responsive phone/tablet layouts, and keeps web UI port 8785.
+# Version 2.1.4 keeps the fixed q/a/o/h/v colors and responsive UI, and hardens connection/reconnect stability.
 # Migrate only the old untouched default; explicitly customized ports are preserved.
 if [[ -z "${XSUKAX_PORT:-}" ]] && grep -q '^XSUKAX_PORT=8080$' "$CONFIG_FILE"; then
   sed -i 's/^XSUKAX_PORT=8080$/XSUKAX_PORT=8785/' "$CONFIG_FILE"
@@ -3277,6 +3364,16 @@ set_config() {
 [[ -n "${ALLOW_PRIVATE_IRC:-}" ]] && set_config ALLOW_PRIVATE_IRC "$ALLOW_PRIVATE_IRC"
 [[ -n "${ALLOW_CROSS_ORIGIN:-}" ]] && set_config ALLOW_CROSS_ORIGIN "$ALLOW_CROSS_ORIGIN"
 [[ -n "${LOG_LEVEL:-}" ]] && set_config LOG_LEVEL "$LOG_LEVEL"
+[[ -n "${XSUKAX_IRC_CONNECT_TIMEOUT:-}" ]] && set_config XSUKAX_IRC_CONNECT_TIMEOUT "$XSUKAX_IRC_CONNECT_TIMEOUT"
+[[ -n "${XSUKAX_WS_SETUP_TIMEOUT:-}" ]] && set_config XSUKAX_WS_SETUP_TIMEOUT "$XSUKAX_WS_SETUP_TIMEOUT"
+[[ -n "${XSUKAX_WS_HEARTBEAT:-}" ]] && set_config XSUKAX_WS_HEARTBEAT "$XSUKAX_WS_HEARTBEAT"
+
+# Existing installations may not yet have the new stability keys. Add them without
+# changing any values the administrator has already chosen.
+for pair in   "XSUKAX_IRC_CONNECT_TIMEOUT=35"   "XSUKAX_WS_SETUP_TIMEOUT=120"   "XSUKAX_WS_HEARTBEAT=60"; do
+  key=${pair%%=*}; value=${pair#*=}
+  grep -q "^${key}=" "$CONFIG_FILE" || printf '%s=%s\n' "$key" "$value" >> "$CONFIG_FILE"
+done
 chmod 0644 "$CONFIG_FILE"
 
 cat > "$SERVICE_FILE" <<'EOF_SERVICE'
